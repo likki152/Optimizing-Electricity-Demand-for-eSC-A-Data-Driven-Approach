@@ -1,0 +1,635 @@
+# IDS Project
+
+## DATA MUNGING
+
+```{r}
+# Load all the required libraries
+library(tidyverse)    # Comprehensive data manipulation and visualization
+library(arrow)        # Reading and writing Arrow format data
+library(dplyr)        # Data manipulation using pipes and verbs
+library(data.table)   # Fast and efficient data manipulation
+library(lubridate)    # Date and time manipulation
+library(caret)        # Machine learning modeling and evaluation
+library(xgboost)      # Extreme Gradient Boosting (XGBoost) algorithm
+library(Matrix)       # Sparse matrix representation and manipulation
+library(ggplot2)      # Data visualization with ggplot2
+```
+
+```{r}
+# URLs for static house info and metadata
+static_house_url <- "https://intro-datascience.s3.us-east-2.amazonaws.com/SC-data/static_house_info.parquet"
+Meta_url <- "https://intro-datascience.s3.us-east-2.amazonaws.com/SC-data/data_dictionary.csv"
+
+# Read static house info from parquet file
+static_house <- read_parquet(static_house_url)
+
+# Read metadata from CSV file
+Meta_data <- read_csv_arrow(Meta_url)
+
+# Extract house IDs from static house data
+house_ids <- static_house %>% pull(bldg_id)
+
+# Extract unique county IDs from static house data
+county_ids <- static_house %>% pull(in.county) %>% unique()
+```
+
+```{r}
+# Set initial counter value
+xx = 1
+
+# Initialize an empty tibble for electricity usage
+electricity_usage <- tibble(total_electricity = numeric(), time = Date())
+
+# Loop through house_ids to fetch and process electricity usage data for each house
+for (id in house_ids) {
+  # Try reading electricity data from the specified URL
+  electricity <- try(read_parquet(paste0("https://intro-datascience.s3.us-east-2.amazonaws.com/SC-data/2023-houseData/", id, ".parquet")))
+  
+  # Print current iteration count
+  print(xx)
+  
+  # Check if reading the electricity data was successful
+  if (class(electricity)[1] != "try-error") {
+    # Filter and process electricity data for a specific date range
+    temp <- electricity %>% 
+      filter(time >= as.Date("2018-07-01"), time <= as.Date("2018-07-31")) %>%
+      # Calculate total electricity usage by summing relevant columns
+      mutate(total_electricity = rowSums(select(., contains("electricity")), na.rm = TRUE)) %>%
+      select(total_electricity, time) %>%
+      # Add house/building ID for identification
+      mutate(bldg_id = id)
+
+    # Combine the current house's electricity usage data with the overall electricity_usage tibble
+    electricity_usage <- bind_rows(electricity_usage, temp)
+    
+    # Remove temporary data frame to free up memory
+    rm(temp)
+    
+    # Increment the counter
+    xx = xx + 1
+  }
+}
+```
+
+```{r}
+# Convert 'time' column to datetime if it's not already in POSIXct format
+electricity_usage$time <- as.POSIXct(electricity_usage$time, format = "%Y-%m-%d %H:%M:%S")
+
+# Create a new column 'day' by extracting the date from the 'time' column
+# This will be used for grouping by day in the next step
+electricity_usage <- electricity_usage %>%
+  mutate(day = as.Date(time))
+
+# Group by 'bldg_id' and 'day', and calculate the sum of 'total_electricity'
+daily_electricity_usage <- electricity_usage %>%
+  group_by(bldg_id, day) %>%
+  summarize(daily_total_electricity = sum(total_electricity, na.rm = TRUE))
+```
+
+```{r}
+# Adding Daily total electricity to static house dataframe
+Static_Electricty <- merge(static_house, daily_electricity_usage, by = "bldg_id")
+```
+
+```{r}
+# Create an empty tibble for weather data
+weather <- tibble(
+  `Dry Bulb Temperature [°C]` = numeric(),
+  `Relative Humidity [%]` = numeric(),
+  `Wind Speed [m/s]` = numeric(),
+  `Wind Direction [Deg]` = numeric(),
+  `Global Horizontal Radiation [W/m2]` = numeric(),
+  `Direct Normal Radiation [W/m2]` = numeric(),
+  `Diffuse Horizontal Radiation [W/m2]` = numeric(),
+  county_id = character(),
+  date_time = Date()
+)
+
+# Loop through county_ids to fetch and process weather data for each county
+for (county in county_ids) {
+  # Read weather data from the specified URL
+  weather_D <- read_csv(paste0("https://intro-datascience.s3.us-east-2.amazonaws.com/SC-data/weather/2023-weather-data/", county, ".csv")) %>%
+    # Select relevant columns and filter data for a specific date range
+    select(date_time, `Dry Bulb Temperature [°C]`, `Relative Humidity [%]`, `Wind Speed [m/s]`, `Wind Direction [Deg]`, `Global Horizontal Radiation [W/m2]`, `Direct Normal Radiation [W/m2]`, `Diffuse Horizontal Radiation [W/m2]`) %>%
+    filter(date_time >= as.Date("2018-07-01"), date_time <= as.Date("2018-07-31")) %>%
+    # Add county_id column for identification
+    mutate(county_id = county) 
+  
+  # Combine the current county's weather data with the overall weather tibble
+  weather <- bind_rows(weather, weather_D)
+}
+```
+
+```{r}
+#Loading weather dataset and grouping by county and day
+weather_final <- weather
+
+# Convert 'date_time' to just a Date object to remove the time part
+weather_final$date_time <- as.Date(weather_final$date_time, format = "%Y-%m-%d %H:%M:%S")
+
+# Now group by 'date_time' and 'county_id' and calculate the mean for the other columns
+weather_final <- weather_final %>%
+  group_by(county_id, date_time) %>%
+  summarise(
+    mean_Direct_Normal_Radiation = mean(`Direct Normal Radiation [W/m2]`, na.rm = TRUE),
+    mean_Dry_Bulb_Temperature = mean(`Dry Bulb Temperature [°C]`, na.rm = TRUE),
+      mean_Relative_Humidity = mean(`Relative Humidity [%]`, na.rm = TRUE),
+      mean_Wind_Speed = mean(`Wind Speed [m/s]`, na.rm = TRUE))
+```
+
+```{r}
+# Rename columns in weather_final
+weather_final <- weather_final %>% rename(day = date_time)  
+weather_final <- weather_final %>% rename(in.county = county_id)
+
+# Merge weather and electricity consumption datasets
+StaticHouse_Weather <- merge(Static_Electricty, weather_final, by = c("in.county", "day"))
+```
+
+```{r}
+#checking the null values in the df.
+total_null_values <- 0
+
+# Iterate over each column in the dataframe
+for (col in colnames(StaticHouse_Weather)) {
+  # Sum the null values for the current column
+  col_null_values <- sum(is.na(StaticHouse_Weather[[col]]))
+  
+  # Print or store information about null values for the current column
+  print(paste("Column:", col, "has", col_null_values, "null values."))
+  
+  # Add the null values for the current column to the total count
+  total_null_values <- total_null_values + col_null_values
+}
+
+# Display the total number of null values in the entire dataframe
+print(paste("Total null values in the dataframe:", total_null_values))
+```
+
+```{r}
+# Select only numeric columns and generate summary
+StaticHouse_Weather %>% 
+  select_if(is.numeric) %>% 
+  summary()
+```
+
+```{r}
+# Select only non numeric columns and generate summary
+StaticHouse_Weather %>% 
+  select_if(~ !is.numeric(.)) %>% 
+  summary()
+```
+
+```{r}
+# Identify columns with only one unique value
+single_value_cols <- sapply(StaticHouse_Weather, function(x) length(unique(x)) == 1)
+
+# Subset the dataframe to exclude columns with only one unique value
+StaticHouse_Weather_Filtered <- StaticHouse_Weather[, !single_value_cols]
+
+# Check and print the dimensions of the filtered dataframe
+dim(StaticHouse_Weather_Filtered)
+
+# Replace "None" with "No" in the entire dataframe
+StaticHouse_Weather_Filtered <- StaticHouse_Weather_Filtered %>% mutate(across(-day, ~ ifelse(. == "None", "No", .)))
+
+# Replace empty strings with NA
+StaticHouse_Weather_Filtered[StaticHouse_Weather_Filtered == ''] <- NA
+
+# Function to calculate the percentage of nulls in each column
+percentage_nulls <- function(column) {
+  sum(is.na(column)) / length(column) * 100
+}
+
+# Apply the function to each column and get columns below a 10% null threshold
+column_null_percentage <- sapply(StaticHouse_Weather_Filtered, percentage_nulls)
+columns_above_threshold <- names(column_null_percentage[column_null_percentage < 10])
+
+# Extract only those columns from the original data frame
+StaticHouse_Weather_Filtered <- StaticHouse_Weather_Filtered[, columns_above_threshold]
+
+# Check and print the dimensions of the filtered dataframe
+dim(StaticHouse_Weather_Filtered)
+
+# Remove rows with any remaining missing values
+StaticHouse_Weather_Filtered <- na.omit(StaticHouse_Weather_Filtered)
+
+# Check and print the final dimensions of the filtered dataframe
+dim(StaticHouse_Weather_Filtered)
+```
+
+```{r}
+# Select non-numeric columns and display unique values
+StaticHouse_Weather_Filtered %>% 
+  select_if(~ !is.numeric(.)) %>%
+  lapply(unique)
+```
+
+```{r}
+# List of columns to be dropped from the dataframe
+drop_col <- c('global_horizontal_radiation_[w/m2]','direct_normal_radiation_[w/m2]', "in.puma", "in.clothes_washer_presence", "in.geometry_building_horizontal_location_mf", "in.geometry_building_horizontal_location_sfa", "in.geometry_building_level_mf", "bldg_id", "in.vintage_acs", "in.county_and_puma", "in.vintage")
+```
+
+```{r}
+# Remove specified columns from the dataframe
+StaticHouse_Weather_Filtered <- StaticHouse_Weather_Filtered[, setdiff(names(StaticHouse_Weather_Filtered), drop_col)]
+```
+
+```{r}
+#selecting necessary rows
+
+# Loop through each column
+for (i in 1:ncol(StaticHouse_Weather_Filtered)) {
+  # Count NA values
+  na_count <- sum(is.na(StaticHouse_Weather_Filtered[[i]]))
+  
+  # Count zero values (excluding NA values in the count)
+  zero_count <- sum(StaticHouse_Weather_Filtered[[i]] == 0, na.rm = TRUE)
+
+  # Print the count of NA and zero values for the column
+  cat("Column '", colnames(StaticHouse_Weather_Filtered)[i], "' has ", na_count, " NA values and ", zero_count, " zero values.\n")
+}
+```
+
+```{r}
+# Identify and handle negative values in 'daily_total_electricity'
+neg_values <- which(StaticHouse_Weather_Filtered$daily_total_electricity < 0)
+
+# Create a vector of index values to remove
+rows_to_remove <- which(StaticHouse_Weather_Filtered$daily_total_electricity < 0)
+ 
+# Create a new data frame without the specified rows
+StaticHouse_Weather_Filtered <- StaticHouse_Weather_Filtered[-rows_to_remove, ]
+
+# Define a function to convert range to mean
+range_to_mean <- function(range_str) {
+  # Handle cases where the value is greater than a number (e.g., ">100000")
+  if (grepl(">", range_str)) {
+    # Assuming ">X" means "X+1" for the purposes of finding a mean
+    return(as.numeric(gsub(">", "", range_str)) + 1)
+  }
+  
+  # Handle cases where the value is less than a number (e.g., "<3000")
+  if (grepl("<", range_str)) {
+    # Assuming "<X" means "X-1" for the purposes of finding a mean
+    return(as.numeric(gsub("<", "", range_str)) - 1)
+  }
+
+  # Split the string on the hyphen
+  parts <- strsplit(range_str, "-")[[1]]
+  
+  # Remove any '+' signs and convert to numeric
+  parts <- as.numeric(gsub("\\+", "", parts))
+  
+  # Calculate the mean of the two numbers
+  if (length(parts) == 2) {
+    return(mean(parts))
+  } else {
+    # If there's no range, just return the number itself
+    return(parts[1])
+  }
+}
+
+# Convert range values to mean in 'in.geometry_floor_area' and 'in.geometry_floor_area_bin'
+StaticHouse_Weather_Filtered$in.geometry_floor_area <- sapply(StaticHouse_Weather_Filtered$in.geometry_floor_area, range_to_mean)
+StaticHouse_Weather_Filtered$in.geometry_floor_area_bin <- sapply(StaticHouse_Weather_Filtered$in.geometry_floor_area_bin, range_to_mean)
+
+# Count missing values after the range-to-mean conversion
+sum(is.na(StaticHouse_Weather_Filtered))
+
+# Apply range-to-mean conversion to specified columns
+StaticHouse_Weather_Filtered$in.income <- sapply(StaticHouse_Weather_Filtered$in.income, range_to_mean)
+StaticHouse_Weather_Filtered$in.income_recs_2015 <- sapply(StaticHouse_Weather_Filtered$in.income_recs_2015, range_to_mean)
+StaticHouse_Weather_Filtered$in.income_recs_2020 <- sapply(StaticHouse_Weather_Filtered$in.income_recs_2020, range_to_mean)
+
+# Remove 'Hour' prefix and convert to numeric in specific columns
+StaticHouse_Weather_Filtered$in.bathroom_spot_vent_hour <- as.numeric(sub("Hour", "", StaticHouse_Weather_Filtered$in.bathroom_spot_vent_hour))
+StaticHouse_Weather_Filtered$in.range_spot_vent_hour <- as.numeric(sub("Hour", "", StaticHouse_Weather_Filtered$in.range_spot_vent_hour))
+
+# Remove 'F' suffix and convert to numeric in specific columns
+StaticHouse_Weather_Filtered$in.cooling_setpoint <- as.numeric(sub("F", "", StaticHouse_Weather_Filtered$in.cooling_setpoint))
+StaticHouse_Weather_Filtered$in.cooling_setpoint_offset_magnitude <- as.numeric(sub("F", "", StaticHouse_Weather_Filtered$in.cooling_setpoint_offset_magnitude))
+StaticHouse_Weather_Filtered$in.heating_setpoint <- as.numeric(sub("F", "", StaticHouse_Weather_Filtered$in.heating_setpoint))
+StaticHouse_Weather_Filtered$in.heating_setpoint_offset_magnitude <- as.numeric(sub("F", "", StaticHouse_Weather_Filtered$in.heating_setpoint_offset_magnitude))
+
+# Remove ' ACH50' suffix and convert to numeric in specific columns
+StaticHouse_Weather_Filtered$in.infiltration <- as.numeric(sub(" ACH50", "", StaticHouse_Weather_Filtered$in.infiltration))
+
+# Remove '+' signs and convert to numeric in 'in.occupants' column
+StaticHouse_Weather_Filtered$in.occupants <- as.numeric(gsub("\\+", "", StaticHouse_Weather_Filtered$in.occupants))
+```
+
+```{r}
+# Function to drop columns with only one unique value
+drop_single_unique_columns <- function(data) {
+
+  single_unique_cols <- sapply(data, function(col) length(unique(col)) == 1)
+
+  return(data[, !single_unique_cols, drop = FALSE])
+
+}
+ 
+# Use the function to drop columns
+StaticHouse_Weather_Filtered <- drop_single_unique_columns(StaticHouse_Weather_Filtered)
+```
+
+```{r}
+# Checking unique values
+StaticHouse_Weather_Filtered %>% 
+  select_if(~ !is.numeric(.)) %>%
+  lapply(unique)
+```
+
+```{r}
+# Final Dataset with Static House Data, Energy Consumption Data and Weather Data
+Final_Dataset <- StaticHouse_Weather_Filtered
+```
+
+## MODELS
+
+```{r}
+# Splitting the Dataset into train_data and test_data
+set.seed(1000)
+trainIndex <- createDataPartition(Final_Dataset$daily_total_electricity , p = 0.8, list = FALSE)
+train_data <- Final_Dataset[trainIndex, ]
+test_data <- Final_Dataset[-trainIndex, ]
+```
+
+### LM
+
+```{r}
+# now lets run a lm model with new dataframe
+lmout <- lm(daily_total_electricity ~ ., data = train_data)
+
+# Summary for lmout
+summary(lmout)
+```
+
+```{r}
+# Predicted values from the linear regression model
+predicted_values <- predict(lmout, newdata = test_data)
+
+# Actual values from the test dataset
+actual_values <- test_data$daily_total_electricity
+
+# Calculate MAE, MSE, RMSE, R-squared, and MAPE
+MAE <- mean(abs(predicted_values - actual_values))
+MSE <- mean((predicted_values - actual_values)^2)
+RMSE <- sqrt(mean((predicted_values - actual_values)^2))
+R_squared <- 1 - (sum((actual_values - predicted_values)^2) / sum((actual_values - mean(actual_values))^2))
+mape <- mean(abs((test_data$daily_total_electricity - predicted_values) / test_data$daily_total_electricity )) * 100
+
+# Print the metrics
+cat("Actual Values:", sum(actual_values), "\n")
+cat("Predicted Values:", sum(predicted_values), "\n")
+print(paste("MAPE:", mape))
+cat("Mean Absolute Error (MAE):", MAE, "\n")
+cat("Mean Squared Error (MSE):", MSE, "\n")
+cat("Root Mean Squared Error (RMSE):", RMSE, "\n")
+cat("R-squared (R²):", R_squared, "\n")
+```
+
+```{r}
+# Print the coefficients
+coefficients <- coef(lmout)
+print(coefficients)
+```
+
+```{r}
+# Create a new dataframe for prediction data
+pred_data <- Final_Dataset
+
+# Add 5 to the 'mean_Dry_Bulb_Temperature' column
+pred_data$mean_Dry_Bulb_Temperature <- pred_data$mean_Dry_Bulb_Temperature + 5
+```
+
+```{r}
+# Predicted values from the linear regression model
+predicted_values_new <- predict(lmout, newdata = pred_data)
+
+cat("Sum of Predicted Values with 5 degree increase in temperature:", sum(predicted_values_new), "\n")
+
+cat("Percent Change in Total Electricity Consumption with 5 degree increase in temperature:", ((sum(predicted_values_new) - sum(Final_Dataset$daily_total_electricity))/ sum(Final_Dataset$daily_total_electricity))*100, "\n")
+```
+
+```{r}
+
+```
+
+```{r}
+#Adding the predicted values to the pred_data
+pred_data$new_total_energy <- predicted_values_new
+
+percentage <- ((pred_data$new_total_energy - Final_Dataset$daily_total_electricity)/ Final_Dataset$daily_total_electricity)*100
+
+# Index for day with Peak future energy demand
+day_peak <- which.max((percentage))
+
+cat("Day with Peak Future Energy Demand", "\n")
+print(pred_data$day[22991])
+```
+
+```{r}
+# Extract the top 10 rows based on the 'new_total_energy' column in descending order
+top_10_rows <- pred_data[order(-pred_data$new_total_energy), ][1:10, ]
+
+# Display the top 10 rows
+top_10_rows
+```
+
+### VISUALIZATION
+
+```{r}
+# Create a bar plot using ggplot2
+ggplot(StaticHouse_Weather, aes(x = day, y = daily_total_electricity, fill = in.city)) +
+  geom_bar(stat = "sum") +  # Use geom_bar to create a bar plot with summed values
+  labs(title = "Daily Total Electricity by County", x = "Day", y = "Daily Total Electricity")
+```
+
+```{r}
+# Calculate the average daily total electricity consumption per cooling setpoint
+avg_electricity_per_setpoint <- Final_Dataset %>%
+  group_by(in.cooling_setpoint) %>%
+  summarize(avg_daily_electricity = mean(daily_total_electricity))
+
+# Create a beautiful bar plot
+ggplot(avg_electricity_per_setpoint, aes(x = factor(in.cooling_setpoint), y = avg_daily_electricity)) +
+  geom_bar(stat = "identity", fill = "#69b3a2") +  # Create a bar plot with specified fill color
+  labs(title = "Average Electricity Consumption per Cooling Setpoint",  # Set plot title
+       x = "Cooling Setpoint",  # Label x-axis
+       y = "Average Daily Electricity Consumption") +  # Label y-axis
+  theme_minimal() +  # Use a minimal theme for the plot
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))  # Adjust x-axis text angle for better readability
+```
+
+```{r}
+# Modify 'None' values in 'in.hvac_cooling_type' to 'No Cooling System'
+df2_bargraph <- StaticHouse_Weather %>%
+  mutate(in.hvac_cooling_type = ifelse(in.hvac_cooling_type == 'None', 'No Cooling System', in.hvac_cooling_type))
+
+# Create a bar graph
+ggplot(df2_bargraph, aes(x = in.hvac_cooling_type, y = daily_total_electricity, fill = in.hvac_cooling_type)) +
+  geom_col() +  # Use geom_col to create a bar graph
+  labs(x = "HVAC Cooling Type", y = "Daily Total Electricity (kWh)", title = "Daily Total Electricity Usage by Type of Cooling System") +
+  scale_y_continuous(labels = scales::comma) +  # Format y-axis labels with commas
+  theme_minimal() +  # Use a minimal theme for the plot
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))  # Rotate x-axis labels if needed
+
+```
+
+```{r}
+# Filter for July
+july_data <- electricity[format(electricity$time, "%Y-%m") == "2018-07", ]
+
+# Extract relevant columns for July
+july_data_filtered <- july_data %>%
+  filter(month(time) == 7)
+ 
+# Melt the data to long format
+july_data_melted <- july_data_filtered %>%
+  select(time, contains(".energy_consumption")) %>%
+  pivot_longer(cols = -time, names_to = "appliance", values_to = "consumption")
+# Extract appliance names
+july_data_melted$appliance <- gsub("out\\.electricity\\.(.*?)\\.energy_consumption", "\\1",july_data_melted$appliance)
+ 
+
+# Set a threshold for minimum energy consumption (adjust as needed)
+min_consumption_threshold <- 0.1  # Change this threshold as per your data
+# Filter the data for main appliances with significant energy consumption
+july_data_filtered_main <- july_data_melted %>%
+  group_by(appliance) %>%
+  summarize(total_consumption = sum(consumption)) %>%
+  filter(total_consumption > min_consumption_threshold) %>%
+  inner_join(july_data_melted)
+# Create a bar chart for energy consumption by main appliances
+ggplot(july_data_filtered_main, aes(x = factor(appliance), y = consumption, fill = appliance)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Energy Consumption by Main Appliances in July",
+       x = "Main Appliance",
+       y = "Total Energy Consumption") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+# Create a ggplot object with data and aes layers 
+p <- ggplot(pred_data, aes(x = daily_total_electricity, y = new_total_energy)) +   geom_point(color = "blue", size = 1) +  
+# Change point color to blue and size to 1   
+geom_smooth(method = "lm", color = "red", se = FALSE) +  
+# Add a red linear regression line without confidence interval   
+labs(title = "Energy Prediction Analysis",        x = "Daily Total Electricity",        y = "Predicted Energy Consumption") 
+# Print the plot print(p)
+print(p)
+```
+
+## MODELS WE DISCARDED
+
+### XGBOOST: WE DIDN'T GO AHEAD WITH THIS MODEL
+
+```{r}
+# Convert the categorical variable to a one-hot encoded format
+df_encoded <- model.matrix(~ . - 1, data = Final_Dataset)
+
+# Split the data into training and testing sets
+set.seed(42)
+split_index <- sample(1:nrow(df_encoded), 0.7 * nrow(df_encoded))
+train_encoded <- df_encoded[split_index, ]
+test_encoded <- df_encoded[-split_index, ]
+
+# Create target variables for train and test
+y_train <- Final_Dataset$daily_total_electricity [split_index]
+y_test <- Final_Dataset$daily_total_electricity[-split_index]
+
+# Create DMatrix for XGBoost using the training set
+dtrain <- xgb.DMatrix(data = as.matrix(train_encoded), label = y_train)
+
+# Specify XGBoost parameters (adjust as needed)
+params <- list(
+  objective = "reg:squarederror",
+  eval_metric = "mae"  # Using RMSE as an example metric
+)
+
+# Train the XGBoost model
+xgb_model <- xgboost(params = params, data = dtrain, nrounds = 50)
+
+# Make predictions on the test set
+predictions <- predict(xgb_model, as.matrix(test_encoded))
+
+# Evaluate the accuracy of the model
+accuracy <- sqrt(mean((predictions - y_test)^2))  # Root Mean Squared Error (RMSE)
+
+# Print the accuracy
+print(paste("RMSE on the test set:", accuracy))
+```
+
+```{r}
+pred_xg <- Final_Dataset
+pred_xg$mean_Dry_Bulb_Temperature <- pred_data$mean_Dry_Bulb_Temperature + 5
+
+# Convert the categorical variable to a one-hot encoded format
+pred_encoded <- model.matrix(~ . - 1, data = pred_xg)
+ 
+# Create the target variable
+y <- pred_xg$daily_total_electricity
+
+# Make predictions on the test set
+predictions_xg <- predict(xgb_model, as.matrix(pred_encoded))
+
+# Evaluate the accuracy of the model
+accuracy <- sqrt(mean((predictions_xg - y)^2))  # Root Mean Squared Error (RMSE)
+
+# Print the accuracy
+print(paste("RMSE on the test set:", accuracy))
+
+summary(predictions_xg)
+```
+
+```{r}
+# Calculate the sum of predictions from the XGBoost model
+sum_predictions_xg <- sum(predictions_xg)
+
+# Calculate the sum of the actual daily total electricity consumption in the Final_Dataset
+sum_actual_electricity <- sum(Final_Dataset$daily_total_electricity)
+
+# Calculate the percentage difference between predicted and actual sums
+percentage_difference <- ((sum_predictions_xg - sum_actual_electricity) / sum_actual_electricity) * 100
+
+# Print Percentage Difference
+print(percentage_difference)
+```
+
+### SVM: WE DIDN'T GO AHEAD WITH THIS MODEL
+
+```{r}
+# Split the data into training and testing sets
+set.seed(123)
+trainIndex <- createDataPartition(Final_Dataset$daily_total_electricity , p = 0.8, list = FALSE)
+svm_train_data <- Final_Dataset[trainIndex, ]
+svm_test_data <- Final_Dataset[-trainIndex, ]
+
+# Check factor levels in the training and testing datasets
+levels(svm_train_data$daily_total_electricity)
+levels(svm_test_data$daily_total_electricity)
+
+# Convert total_electricity to a factor with levels
+train_data$daily_total_electricity <- factor(svm_train_data$daily_total_electricity)
+test_data$daily_total_electricity <- factor(svm_test_data$daily_total_electricity)
+```
+
+```{r}
+# Train an SVM model with a radial kernel
+svm_model <- svm(daily_total_electricity ~ ., data = train_data, kernel = "radial")
+
+# Make predictions on the test set
+svm_predictions <- predict(svm_model, newdata = test_data)
+
+# Evaluate the model
+svm_confusion_matrix <- confusionMatrix(svm_predictions, test_data$daily_total_electricity)
+
+# Print the confusion matrix
+print(svm_confusion_matrix)
+
+# Additional evaluation metrics
+svm_metrics <- postResample(pred = svm_predictions, obs = test_data$daily_total_electricity)
+print(svm_metrics)
+```

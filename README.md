@@ -91,6 +91,4 @@ eSC faces challenges in managing increased energy demand, especially during extr
 - Enhance Shiny app with real-time weather and energy data.
 - Explore deeper customer segmentation for targeted recommendations.
 
----
 
-For more details, refer to the [Final Report](./Group-5-Project-Report.pdf) and [Presentation](./Optimizing-Electricity-Demand-for-eSC-A-Data-Driven-Approach.pptx).
